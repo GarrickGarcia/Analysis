@@ -1,11 +1,10 @@
 from arcgis.gis import GIS
 from arcgis.geocoding import geocode
-from arcgis.geometry import Geometry
-from arcgis.features import FeatureLayer
-from arcgis.geometry import filters
-from arcgis.features import GeoAccessor, GeoSeriesAccessor
+from arcgis.geometry import Geometry, filters
+from arcgis.features import FeatureLayer, FeatureSet
 import pandas as pd
 import arcpy
+import yaml
 
 # Load credentials from CityLogins.yaml
 import yaml
@@ -42,17 +41,30 @@ def create_address(street, city, state, zip_code):
     """
     return f"{street}, {city}, {state} {zip_code}"
 
-def geocode_address(address):
+def geocode_address(address, location_type="rooftop"):
     """
     Geocodes an address and returns the geometry of the first match.
     Raises a ValueError if no matches are found.
+    
+    Args:
+        address (str): A single-line address.
+        location_type (str): 'rooftop', 'street', or 'none'.
+    
+    Returns:
+        dict: A dictionary representing the geometry of the first geocoded match.
     """
-    geocoded_location_fs = geocode(address, as_featureset=True)
+    geocoded_location_fs = geocode(
+        address=address,
+        location_type=location_type,
+        as_featureset=True
+    )
     if not geocoded_location_fs or not geocoded_location_fs.features:
         raise ValueError(f"Address '{address}' could not be geocoded.")
+
     address_point = geocoded_location_fs.features[0].geometry
     if "spatialReference" not in address_point:
         address_point["spatialReference"] = {"wkid": 4326}
+
     return address_point
 
 def dict_to_arcpy_point_geometry(api_geom_dict):
@@ -82,10 +94,19 @@ input_address = create_address(street_address, city, state, zip_code)
 
 # Parameters
 parcel_service_url = "https://services6.arcgis.com/o5a9nldztUcivksS/arcgis/rest/services/Benton_Harbor_Parcels/FeatureServer/0"  # Replace with the actual URL of the parcel layer
-buffer_distance = '100 Feet'  # Distance in feet
+parcel_layer = FeatureLayer(parcel_service_url)
+buffer_distance = '200 Feet'  # Distance in feet
 
 # Geocode the input address
-address_point = geocode_address(input_address)
+address_point = geocode_address(input_address, location_type="rooftop")
+# Convert your point dict into a FeatureSet so it can be displayed
+point_fset = FeatureSet([{"attributes": {}, "geometry": address_point}])
+
+# make a map widget and display the geocoded point ands the parcels
+map1 = gis.map("Benton Harbor, MI")
+map1.content.add(parcel_layer)
+map1.content.add(point_fset)
+map1
 
 arcpy_pt = dict_to_arcpy_point_geometry(address_point)
 
@@ -94,14 +115,11 @@ arcpy.management.CreateFeatureclass(r"memory", "pt", "POINT", spatial_reference=
 with arcpy.da.InsertCursor("pt", "SHAPE@") as cursor:
     cursor.insertRow([arcpy_pt])
 
-point_df = pd.DataFrame.spatial.from_featureclass("pt")
-# list the spatial reference of the point
-sr = arcpy_pt.spatialReference
-print(sr.name)
-
-
 workspace = r"memory"
 arcpy.env.workspace = workspace
+# Get the coordinate system of the parcel layer
+coordinate_system = arcpy.SpatialReference(parcel_layer.properties.extent.spatialReference.wkid)
+arcpy.env.outputCoordinateSystem = coordinate_system
 
 # Create a buffer around the arcpy point
 buffer = "buffer"
@@ -111,5 +129,14 @@ arcpy.analysis.PairwiseBuffer(arcpy_pt, buffer, buffer_distance)
 neighbors = 'neighbors'
 arcpy.analysis.Clip(parcel_service_url, buffer, neighbors)
 
+# feature to point
+neighbors_points = 'neighbors_points'
+arcpy.management.FeatureToPoint(neighbors, neighbors_points, "INSIDE")
+
 # convert the clipped parcels to a pandas dataframe
-neighbors_df = pd.DataFrame.spatial.from_featureclass(neighbors)
+neighbors_df = pd.DataFrame.spatial.from_featureclass(neighbors_points)
+# keep only columns address, owner, and SHAPE
+neighbors_df = neighbors_df[['address', 'owner', 'SHAPE']]
+
+# add neighbors_df to the map
+neighbors_df.spatial.plot(map_widget=map1)
